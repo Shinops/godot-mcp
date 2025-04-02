@@ -13,6 +13,7 @@ import { existsSync, readdirSync, mkdirSync } from 'fs';
 import { spawn } from 'child_process';
 import { promisify } from 'util';
 import { exec } from 'child_process';
+import * as fs from 'fs'; // Import the 'fs' module
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -1010,31 +1011,44 @@ class GodotServer {
        commandArgs.push('--debug');
      }
 
+     // Define the log file path within the project directory
+     const logFilePath = join(args.projectPath, 'cline_godot_run.log');
+     // Add the --log-file argument for Godot
+     commandArgs.push('--log-file', logFilePath);
+     this.logDebug(`Using Godot's --log-file argument: ${logFilePath}`);
+
+
      this.logDebug(`Spawning Godot project: "${this.godotPath}" with args: ${commandArgs.join(' ')}`);
 
      try {
-       // Use spawn to manage the running process and capture output
-       const godotProcess = spawn(`"${this.godotPath}"`, commandArgs, {
-         shell: true, // Using shell might be necessary depending on how GODOT_PATH is set
-         stdio: ['ignore', 'pipe', 'pipe'], // Ignore stdin, capture stdout/stderr
+       // Use spawn, revert stdio back to pipes to capture potential early launch errors
+       const godotProcess = spawn(this.godotPath, commandArgs, {
+         shell: false, // Keep shell false
+         detached: false, // Keep attached to monitor exit/errors more easily initially
+         stdio: ['ignore', 'pipe', 'pipe'], // Ignore stdin, capture stdout/stderr via pipes
        });
+
+       // No need to unref if not detached
 
        this.activeProcess = {
          process: godotProcess,
-         output: [],
-         errors: [],
+         output: [], // Capture output via pipes again
+         errors: [], // Capture errors via pipes again
        };
 
+       // Capture piped output/error
        godotProcess.stdout.on('data', (data) => {
          const output = data.toString();
          this.activeProcess?.output.push(output);
-         this.logDebug(`Project stdout: ${output}`);
+         // Optionally log to server console, but primary log is the file
+         // this.logDebug(`Project stdout pipe: ${output}`);
        });
 
        godotProcess.stderr.on('data', (data) => {
          const errorOutput = data.toString();
          this.activeProcess?.errors.push(errorOutput);
-         console.error(`Project stderr: ${errorOutput}`);
+         // Log stderr immediately to server console for visibility
+         console.error(`Project stderr pipe: ${errorOutput}`);
        });
 
        godotProcess.on('close', (code) => {
@@ -1062,21 +1076,36 @@ class GodotServer {
   /**
    * Handle the get_debug_output tool
    */
-  private async handleGetDebugOutput() {
-    this.logDebug('Handling get_debug_output');
-    if (this.activeProcess) {
-      // Return copies of the arrays
-      return {
-         content: [
-            { type: 'text', text: `Output lines: ${this.activeProcess.output.length}, Error lines: ${this.activeProcess.errors.length}` }
-         ],
-         output: [...this.activeProcess.output],
-         errors: [...this.activeProcess.errors]
-      };
-    } else {
-      return this.createErrorResponse('No active Godot project is running.');
-    }
-  }
+   private async handleGetDebugOutput() {
+     this.logDebug('Handling get_debug_output');
+     if (this.activeProcess) {
+       // Limit the number of error lines returned
+       const maxErrorLines = 100; // Keep the last 100 error lines
+       const totalErrorLines = this.activeProcess.errors.length;
+       const recentErrors = this.activeProcess.errors.slice(-maxErrorLines);
+       const recentErrorsText = recentErrors.join('\n');
+
+       let responseText = `--- Recent Errors (${Math.min(maxErrorLines, totalErrorLines)}/${totalErrorLines} lines shown) ---\n`;
+       responseText += recentErrorsText || '(No recent errors)';
+
+       // Also include total output line count for context
+       const totalOutputLines = this.activeProcess.output.length;
+       responseText += `\n(Total output lines: ${totalOutputLines})`;
+
+
+       return {
+          content: [
+             { type: 'text', text: responseText }
+          ],
+          // Return only the sliced recent errors and a limited amount of recent output for context if needed
+          // For now, let's keep the full arrays but the primary content is limited
+          output: [...this.activeProcess.output], // Keep full output array for now
+          errors: [...this.activeProcess.errors]  // Keep full error array for now
+       };
+     } else {
+       return this.createErrorResponse('No active Godot project is running.');
+     }
+   }
 
   /**
    * Handle the stop_project tool
