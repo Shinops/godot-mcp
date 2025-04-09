@@ -13,6 +13,7 @@ import { existsSync, readdirSync, mkdirSync } from 'fs';
 import { spawn } from 'child_process';
 import { promisify } from 'util';
 import { exec } from 'child_process';
+import * as fs from 'fs'; // Import the 'fs' module
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -1001,52 +1002,54 @@ class GodotServer {
         return this.createErrorResponse('Godot executable path not found.');
      }
 
-     if (this.activeProcess) {
-       return this.createErrorResponse('A Godot project is already running. Stop it first using stop_project.');
-     }
+      // Kill any existing process
+      if (this.activeProcess) {
+        this.logDebug('Killing existing Godot process before starting a new one');
+        this.activeProcess.process.kill();
+      }
 
-     const commandArgs = ['--path', args.projectPath];
-     if (args.debug || GODOT_DEBUG_MODE) { // Use debug if requested or globally enabled
-       commandArgs.push('--debug');
-     }
+      const cmdArgs = ['-d', '--path', args.projectPath];
+      if (args.scene && this.validatePath(args.scene)) {
+        this.logDebug(`Adding scene parameter: ${args.scene}`);
+        cmdArgs.push(args.scene);
+      }
 
-     this.logDebug(`Spawning Godot project: "${this.godotPath}" with args: ${commandArgs.join(' ')}`);
+      this.logDebug(`Running Godot project: ${args.projectPath}`);
+      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+      const output: string[] = [];
+      const errors: string[] = [];
 
-     try {
-       // Use spawn to manage the running process and capture output
-       const godotProcess = spawn(`"${this.godotPath}"`, commandArgs, {
-         shell: true, // Using shell might be necessary depending on how GODOT_PATH is set
-         stdio: ['ignore', 'pipe', 'pipe'], // Ignore stdin, capture stdout/stderr
-       });
+      process.stdout?.on('data', (data: Buffer) => {
+        const lines = data.toString().split('\n');
+        output.push(...lines);
+        lines.forEach((line: string) => {
+          if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
+        });
+      });
 
-       this.activeProcess = {
-         process: godotProcess,
-         output: [],
-         errors: [],
-       };
+      process.stderr?.on('data', (data: Buffer) => {
+        const lines = data.toString().split('\n');
+        errors.push(...lines);
+        lines.forEach((line: string) => {
+          if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
+        });
+      });
 
-       godotProcess.stdout.on('data', (data) => {
-         const output = data.toString();
-         this.activeProcess?.output.push(output);
-         this.logDebug(`Project stdout: ${output}`);
-       });
+      process.on('exit', (code: number | null) => {
+        this.logDebug(`Godot process exited with code ${code}`);
+        if (this.activeProcess && this.activeProcess.process === process) {
+          this.activeProcess = null;
+        }
+      });
 
-       godotProcess.stderr.on('data', (data) => {
-         const errorOutput = data.toString();
-         this.activeProcess?.errors.push(errorOutput);
-         console.error(`Project stderr: ${errorOutput}`);
-       });
+      process.on('error', (err: Error) => {
+        console.error('Failed to start Godot process:', err);
+        if (this.activeProcess && this.activeProcess.process === process) {
+          this.activeProcess = null;
+        }
+      });
 
-       godotProcess.on('close', (code) => {
-         this.logDebug(`Godot project process exited with code ${code}`);
-         this.activeProcess = null; // Clear active process when it closes
-       });
-
-       godotProcess.on('error', (err) => {
-         console.error('Failed to start Godot project process:', err);
-         this.activeProcess = null; // Clear on error too
-         // We might not be able to return an error directly here as the handler might have already returned
-       });
+      this.activeProcess = { process, output, errors };
 
        return {
          content: [{ type: 'text', text: `Godot project started (PID: ${godotProcess.pid}).` }],
@@ -1063,19 +1066,31 @@ class GodotServer {
    * Handle the get_debug_output tool
    */
   private async handleGetDebugOutput() {
-    this.logDebug('Handling get_debug_output');
-    if (this.activeProcess) {
-      // Return copies of the arrays
-      return {
-         content: [
-            { type: 'text', text: `Output lines: ${this.activeProcess.output.length}, Error lines: ${this.activeProcess.errors.length}` }
-         ],
-         output: [...this.activeProcess.output],
-         errors: [...this.activeProcess.errors]
-      };
-    } else {
-      return this.createErrorResponse('No active Godot project is running.');
+    if (!this.activeProcess) {
+      return this.createErrorResponse(
+        'No active Godot process.',
+        [
+          'Use run_project to start a Godot project first',
+          'Check if the Godot process crashed unexpectedly'
+        ]
+      );
     }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              output: this.activeProcess.output,
+              errors: this.activeProcess.errors,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
   }
 
   /**
@@ -1581,47 +1596,98 @@ class GodotServer {
    * Handle the update_project_uids (resave_resources) tool
    */
   private async handleUpdateProjectUids(args: any) {
-     this.logDebug(`Handling update_project_uids (resave_resources): ${JSON.stringify(args)}`);
-     args = this.normalizeParameters(args); // Normalize parameters
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
 
-     if (!args.projectPath) {
-       return this.createErrorResponse(
-         'Project path is required',
-         ['Provide `projectPath`.']
-       );
-     }
-      if (!this.validatePath(args.projectPath)) {
-         return this.createErrorResponse('Invalid project path provided.');
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      // Ensure godotPath is set
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path'
+            ]
+          );
+        }
+      }
+      
+      // Check if the project directory exists and contains a project.godot file
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects'
+          ]
+        );
       }
 
-     // Add a confirmation step or strong warning? This is a potentially destructive operation.
-     // For now, proceed directly based on the tool call.
+      // Get Godot version to check if UIDs are supported
+      const { stdout: versionOutput } = await execAsync(`"${this.godotPath}" --version`);
+      const version = versionOutput.trim();
+      
+      if (!this.isGodot44OrLater(version)) {
+        return this.createErrorResponse(
+          `UIDs are only supported in Godot 4.4 or later. Current version: ${version}`,
+          [
+            'Upgrade to Godot 4.4 or later to use UIDs',
+            'Use resource paths instead of UIDs for this version of Godot'
+          ]
+        );
+      }
 
-     try {
-       const operationArgs = {}; // No specific args needed for the script operation itself
-       const { stdout, stderr } = await this.executeOperation('resave_resources', operationArgs, args.projectPath);
-
-       if (stderr && stderr.toLowerCase().includes('error')) {
-          console.error(`Godot stderr indicates potential error during resource resave: ${stderr}`);
-          const errorMatch = stderr.match(/ERROR: (.+)/);
-          const specificError = errorMatch ? errorMatch[1] : stderr;
-          return this.createErrorResponse(`Godot reported an error during resource resave: ${specificError}`);
-       }
-
-       if (stdout.includes('Resources resaved successfully')) {
-          return { content: [{ type: 'text', text: 'All project resources resaved successfully.' }] };
-       } else {
-          console.warn(`Resource resave process completed, but success message not found. Stdout: ${stdout}`);
-          return { content: [{ type: 'text', text: 'Resource resave process completed. Check logs for details.' }] };
-       }
-     } catch (error: any) {
-       console.error(`Error resaving resources: ${error.message}`);
-       const stderrMatch = error.message.match(/Stderr: (.+)/);
-       const godotError = stderrMatch ? stderrMatch[1] : 'Check server logs for details.';
-       return this.createErrorResponse(`Failed to resave resources: ${godotError}`);
-     }
-   }
-
+      // Prepare parameters for the operation
+      const params = {
+        project_path: args.projectPath
+      };
+      
+      // Execute the operation
+      const { stdout, stderr } = await this.executeOperation('resave_resources', params, args.projectPath);
+      
+      if (stderr && stderr.includes("Failed to")) {
+        return this.createErrorResponse(
+          `Failed to update project UIDs: ${stderr}`,
+          [
+            'Check if the project is valid',
+            'Ensure you have write permissions to the project directory'
+          ]
+        );
+      }
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Project UIDs updated successfully.\n\nOutput: ${stdout}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to update project UIDs: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the project path is accessible'
+        ]
+      );
+    }
+  }
 
   /**
    * Start the MCP server
